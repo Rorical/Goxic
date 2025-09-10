@@ -22,6 +22,14 @@ type ServerLoadInfo struct {
 	ResponseTime time.Duration `json:"response_time"` // Future: track response times
 }
 
+// PeerFailureInfo tracks connection failure history for peers
+type PeerFailureInfo struct {
+	PeerID       peer.ID   `json:"peer_id"`
+	FailureCount int       `json:"failure_count"`
+	LastFailure  time.Time `json:"last_failure"`
+	LastSuccess  time.Time `json:"last_success"`
+}
+
 // ServerDiscovery manages discovery of available server nodes
 type ServerDiscovery struct {
 	node             *model.Node
@@ -32,6 +40,11 @@ type ServerDiscovery struct {
 	// Load balancing
 	serverLoads map[peer.ID]*ServerLoadInfo
 	loadMutex   sync.RWMutex
+	// Connection failure tracking
+	peerFailures   map[peer.ID]*PeerFailureInfo
+	failureMutex   sync.RWMutex
+	maxFailures    int           // Max failures before blacklisting
+	blacklistTime  time.Duration // How long to avoid failed peers
 	// NodeHandler interface support
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -48,6 +61,10 @@ func NewServerDiscovery(node *model.Node) *ServerDiscovery {
 		updateInterval:   updateInterval,
 		serverLoads:      make(map[peer.ID]*ServerLoadInfo),
 		loadMutex:        sync.RWMutex{},
+		peerFailures:     make(map[peer.ID]*PeerFailureInfo),
+		failureMutex:     sync.RWMutex{},
+		maxFailures:      3,                // Avoid peers after 3 consecutive failures
+		blacklistTime:    10 * time.Minute, // Avoid failed peers for 10 minutes
 	}
 }
 
@@ -294,6 +311,7 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 	peerCount := 0
 	connectedServers := 0
 	filteredOutClients := 0
+	skippedBlacklisted := 0
 
 	for peerInfo := range peerChan {
 		if peerInfo.ID == sd.node.Host.ID() {
@@ -304,18 +322,30 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 			break // Stop collecting after reaching limit
 		}
 
-		// First, try to connect to the peer to exchange protocol information
+		// Skip peers that have failed repeatedly
+		if sd.isBlacklisted(peerInfo.ID) {
+			skippedBlacklisted++
+			continue
+		}
+
+		// Try to connect with shorter timeout to avoid hanging on NAT/firewall issues
 		connectedness := sd.node.Host.Network().Connectedness(peerInfo.ID)
 		if connectedness == 0 { // Not connected
-			connectTimeout := time.Duration(sd.node.Config.Network.ConnectionTimeout) * time.Second
-			connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+			// Use shorter timeout for server discovery to avoid blocking on client nodes behind NAT
+			shortTimeout := 5 * time.Second
+			connectCtx, connectCancel := context.WithTimeout(ctx, shortTimeout)
+			
+			log.Printf("Attempting to connect to discovered peer %s...", peerInfo.ID)
 			if err := sd.node.Host.Connect(connectCtx, peerInfo); err != nil {
-				log.Printf("Failed to connect to discovered peer %s: %v", peerInfo.ID, err)
+				log.Printf("Server discovery: Failed to connect to peer %s (likely client behind NAT): %v", peerInfo.ID, err)
 				connectCancel()
+				// Record the failure and skip this peer
+				sd.recordConnectionFailure(peerInfo.ID)
 				continue
 			}
 			connectCancel()
-			log.Printf("Connected to peer: %s", peerInfo.ID)
+			log.Printf("Server discovery: Successfully connected to peer %s", peerInfo.ID)
+			sd.recordConnectionSuccess(peerInfo.ID)
 			connectedServers++
 		}
 
@@ -324,7 +354,7 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 
 		// Check if this peer is an exit-capable server
 		if !sd.isExitCapableServer(peerInfo.ID) {
-			log.Printf("Filtering out client-only node: %s", peerInfo.ID)
+			log.Printf("Server discovery: Peer %s is not an exit-capable server, disconnecting", peerInfo.ID)
 			filteredOutClients++
 			// Disconnect from client nodes to save resources
 			if connectedness == 0 { // We just connected
@@ -333,7 +363,7 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 			continue
 		}
 
-		log.Printf("Verified exit-capable server node: %s", peerInfo.ID)
+		log.Printf("Server discovery: Verified exit-capable server %s, adding to mesh", peerInfo.ID)
 		newServers = append(newServers, peerInfo)
 		peerCount++
 	}
@@ -341,8 +371,8 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 	sd.serverPeers = newServers
 	sd.lastUpdate = time.Now()
 
-	log.Printf("Server discovery complete: %d exit-capable servers found, %d client nodes filtered out",
-		len(newServers), filteredOutClients)
+	log.Printf("Server discovery complete: %d exit-capable servers found, %d non-servers filtered out, %d successful connections, %d blacklisted peers skipped",
+		len(newServers), filteredOutClients, connectedServers, skippedBlacklisted)
 	return nil
 }
 
@@ -439,6 +469,65 @@ func (sd *ServerDiscovery) isExitCapableServer(peerID peer.ID) bool {
 
 	log.Printf("Peer %s does not support relay protocol (client-only node)", peerID)
 	return false
+}
+
+// isBlacklisted checks if a peer should be avoided due to recent failures
+func (sd *ServerDiscovery) isBlacklisted(peerID peer.ID) bool {
+	sd.failureMutex.RLock()
+	defer sd.failureMutex.RUnlock()
+	
+	failureInfo, exists := sd.peerFailures[peerID]
+	if !exists {
+		return false
+	}
+	
+	// Check if peer has exceeded max failures and is within blacklist time
+	if failureInfo.FailureCount >= sd.maxFailures {
+		timeSinceLastFailure := time.Since(failureInfo.LastFailure)
+		if timeSinceLastFailure < sd.blacklistTime {
+			log.Printf("Peer %s is blacklisted: %d failures, last failure %s ago",
+				peerID, failureInfo.FailureCount, timeSinceLastFailure)
+			return true
+		}
+		// Blacklist time has expired, reset failure count
+		log.Printf("Blacklist expired for peer %s, resetting failure count", peerID)
+		failureInfo.FailureCount = 0
+	}
+	
+	return false
+}
+
+// recordConnectionFailure tracks a failed connection attempt
+func (sd *ServerDiscovery) recordConnectionFailure(peerID peer.ID) {
+	sd.failureMutex.Lock()
+	defer sd.failureMutex.Unlock()
+	
+	failureInfo, exists := sd.peerFailures[peerID]
+	if !exists {
+		failureInfo = &PeerFailureInfo{PeerID: peerID}
+		sd.peerFailures[peerID] = failureInfo
+	}
+	
+	failureInfo.FailureCount++
+	failureInfo.LastFailure = time.Now()
+	
+	log.Printf("Recorded connection failure for peer %s (total failures: %d)",
+		peerID, failureInfo.FailureCount)
+}
+
+// recordConnectionSuccess tracks a successful connection
+func (sd *ServerDiscovery) recordConnectionSuccess(peerID peer.ID) {
+	sd.failureMutex.Lock()
+	defer sd.failureMutex.Unlock()
+	
+	failureInfo, exists := sd.peerFailures[peerID]
+	if !exists {
+		failureInfo = &PeerFailureInfo{PeerID: peerID}
+		sd.peerFailures[peerID] = failureInfo
+	}
+	
+	failureInfo.FailureCount = 0 // Reset failures on successful connection
+	failureInfo.LastSuccess = time.Now()
 }
 
 // refreshServerListForClient discovers server nodes from DHT without server-to-server filtering

@@ -1,12 +1,14 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Rorical/Goxic/server/model"
@@ -32,6 +34,41 @@ func NewRelayHandler() *RelayHandler {
 	return &RelayHandler{
 		pattern: pattern,
 	}
+}
+
+// isNormalConnectionClosure checks if an error represents a normal connection closure
+func isNormalConnectionClosure(err error) bool {
+	if err == nil {
+		return true
+	}
+
+	// Check for EOF (normal end of stream)
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	// Check for network-level normal closures
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+
+	// Check error message for common normal closure patterns
+	errStr := err.Error()
+	normalPatterns := []string{
+		"use of closed network connection",
+		"connection reset by peer",
+		"stream reset",
+		"broken pipe",
+		"EOF",
+	}
+
+	for _, pattern := range normalPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Protocol returns the protocol pattern this handler supports
@@ -115,7 +152,7 @@ func (h *RelayHandler) forwardToNextPeer(income network.Stream, node *model.Node
 	go func() {
 		defer outcome.CloseWrite()
 		_, err := io.Copy(outcome, income)
-		if err != nil {
+		if err != nil && !isNormalConnectionClosure(err) {
 			log.Printf("income -> outcome relay error: %v", err)
 		}
 		done <- err
@@ -124,7 +161,7 @@ func (h *RelayHandler) forwardToNextPeer(income network.Stream, node *model.Node
 	go func() {
 		defer income.CloseWrite()
 		_, err := io.Copy(income, outcome)
-		if err != nil {
+		if err != nil && !isNormalConnectionClosure(err) {
 			log.Printf("outcome -> income relay error: %v", err)
 		}
 		done <- err
@@ -132,7 +169,7 @@ func (h *RelayHandler) forwardToNextPeer(income network.Stream, node *model.Node
 
 	// Wait for either direction to complete
 	err = <-done
-	if err != nil {
+	if err != nil && !isNormalConnectionClosure(err) {
 		log.Printf("Relay forwarding completed with error: %v", err)
 	}
 
@@ -217,7 +254,7 @@ func (h *RelayHandler) bridgeExitTraffic(libp2pStream network.Stream, targetConn
 			}
 		}()
 		_, err := io.Copy(targetConn, libp2pStream)
-		if err != nil {
+		if err != nil && !isNormalConnectionClosure(err) {
 			log.Printf("libp2p -> target copy error: %v", err)
 		}
 		done <- err
@@ -229,7 +266,7 @@ func (h *RelayHandler) bridgeExitTraffic(libp2pStream network.Stream, targetConn
 			libp2pStream.CloseWrite() // Signal end of writes
 		}()
 		_, err := io.Copy(libp2pStream, targetConn)
-		if err != nil {
+		if err != nil && !isNormalConnectionClosure(err) {
 			log.Printf("target -> libp2p copy error: %v", err)
 		}
 		done <- err
@@ -242,7 +279,13 @@ func (h *RelayHandler) bridgeExitTraffic(libp2pStream network.Stream, targetConn
 	targetConn.Close()
 	libp2pStream.Close()
 
-	log.Printf("Exit connection closed for target")
+	// Log connection closure with appropriate level based on error type
+	if err == nil || isNormalConnectionClosure(err) {
+		log.Printf("Exit connection closed normally for target")
+	} else {
+		log.Printf("Exit connection closed with error for target: %v", err)
+	}
+	
 	return err
 }
 
