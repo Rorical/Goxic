@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/Rorical/Goxic/server/handlers"
 	"github.com/Rorical/Goxic/server/model"
@@ -24,16 +25,23 @@ func SetupNode(ctx context.Context, config *model.Config, nodeType NodeType) (*m
 		return nil, fmt.Errorf("failed to create node: %w", err)
 	}
 
-	// Create and configure handler registry with authentication
-	var registry handlers.HandlerRegistry
-	if config.Auth.Enabled {
-		registry = handlers.NewRegistryWithAuth(node, config.Network.Secret)
-	} else {
-		registry = handlers.NewRegistry()
-	}
+	// Create handler registry
+	registry := handlers.NewRegistry()
 	node.Registry = registry
 
-	// Setup handlers based on node type
+	if config.IsBootstrapMode() {
+		log.Printf("Bootstrap mode: only DHT functionality enabled")
+	}
+
+	// Setup handlers based on node type (skip for bootstrap mode)
+	if config.IsBootstrapMode() {
+		log.Printf("Bootstrap mode: skipping protocol handlers, node will only participate in DHT")
+		// Start the registry without custom handlers (just basic DHT functionality)
+		registry.SetupStreamHandlers(node)
+		return node, nil
+	}
+
+	// Setup handlers for client/server modes
 	switch nodeType {
 	case NodeTypeClient:
 		if err := setupClientHandlers(ctx, node, registry); err != nil {
@@ -60,9 +68,22 @@ func SetupNode(ctx context.Context, config *model.Config, nodeType NodeType) (*m
 
 // setupClientHandlers configures handlers for client nodes
 func setupClientHandlers(ctx context.Context, node *model.Node, registry *handlers.Registry) error {
+	// Initialize capability manager for client node
+	capabilityManager := handlers.NewCapabilityManager(node, "client")
+	if err := capabilityManager.AdvertiseCapabilities(); err != nil {
+		return fmt.Errorf("failed to advertise client capabilities: %w", err)
+	}
+
+	// Start capability exchange
+	capabilityManager.StartCapabilityExchange(ctx)
+
+	// Register capability exchange protocol handler
+	capabilityProtocolHandler := handlers.NewCapabilityProtocolHandler(capabilityManager)
+	registry.RegisterStreamHandler(capabilityProtocolHandler)
+
 	// Client nodes run SOCKS5 proxy locally if enabled
 	if node.Config.SOCKS5.Enabled {
-		socks5Handler := handlers.NewSOCKS5Handler(&node.Config.SOCKS5)
+		socks5Handler := handlers.NewSOCKS5HandlerWithCapabilities(&node.Config.SOCKS5, capabilityManager)
 		registry.RegisterNodeHandler(socks5Handler)
 	}
 
@@ -93,7 +114,13 @@ func setupServerHandlers(ctx context.Context, node *model.Node, registry *handle
 	// Server nodes handle relay protocol for traffic routing and exit if enabled
 	if node.Config.Relay.Enabled {
 		relayHandler := handlers.NewRelayHandler()
-		registry.RegisterStreamHandler(relayHandler)
+		if err := registry.RegisterStreamHandler(relayHandler); err != nil {
+			log.Printf("WARNING: Failed to register relay handler: %v", err)
+		} else {
+			log.Printf("Relay handler registered for protocol: %s", relayHandler.Protocol())
+		}
+	} else {
+		log.Printf("Relay functionality disabled in config")
 	}
 
 	return nil

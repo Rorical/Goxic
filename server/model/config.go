@@ -15,7 +15,6 @@ type NetworkConfig struct {
 	Port               int      `json:"port"`               // Main libp2p port (TCP/QUIC)
 	BoostrapNodes      []string `json:"boostrapNodes"`      // DHT bootstrap peers
 	Name               string   `json:"name"`               // Network/service name for DHT
-	Secret             string   `json:"secret"`             // Authentication secret
 	MaxConnections     int      `json:"maxConnections"`     // Maximum peer connections
 	MinConnections     int      `json:"minConnections"`     // Minimum peer connections
 	ConnectionTimeout  int      `json:"connectionTimeout"`  // Connection timeout in seconds
@@ -23,14 +22,6 @@ type NetworkConfig struct {
 	EnableIPv6         bool     `json:"enableIPv6"`         // Enable IPv6 support
 	EnableAutoRelay    bool     `json:"enableAutoRelay"`    // Enable auto relay
 	EnableHolePunching bool     `json:"enableHolePunching"` // Enable hole punching
-}
-
-// AuthConfig contains authentication settings
-type AuthConfig struct {
-	Enabled            bool `json:"enabled"`            // Enable authentication
-	TimeoutSeconds     int  `json:"timeoutSeconds"`     // Auth timeout in seconds
-	ValidityHours      int  `json:"validityHours"`      // Auth validity in hours
-	CleanupIntervalMin int  `json:"cleanupIntervalMin"` // Cleanup interval in minutes
 }
 
 // SOCKS5Config contains SOCKS5 proxy settings
@@ -51,14 +42,25 @@ type RelayConfig struct {
 	BufferSize       int  `json:"bufferSize"`       // Relay buffer size
 }
 
+// ServerSelectionStrategy defines how exit nodes are selected
+type ServerSelectionStrategy string
+
+const (
+	SelectionFirst       ServerSelectionStrategy = "first"        // Always select first available
+	SelectionRandom      ServerSelectionStrategy = "random"       // Random selection
+	SelectionLoadBalance ServerSelectionStrategy = "load_balance" // Load-based selection
+	SelectionPreferred   ServerSelectionStrategy = "preferred"    // Use preferred nodes first
+)
+
 // DiscoveryConfig contains peer discovery settings
 type DiscoveryConfig struct {
-	UpdateIntervalSec     int  `json:"updateIntervalSec"`     // Server discovery interval
-	AdvertiseIntervalSec  int  `json:"advertiseIntervalSec"`  // Advertisement interval
-	QueryTimeoutSec       int  `json:"queryTimeoutSec"`       // DHT query timeout
-	CacheValidityMin      int  `json:"cacheValidityMin"`      // Peer cache validity
-	MaxServers            int  `json:"maxServers"`            // Max cached servers
-	EnableRandomSelection bool `json:"enableRandomSelection"` // Random server selection
+	UpdateIntervalSec    int                     `json:"updateIntervalSec"`    // Server discovery interval
+	AdvertiseIntervalSec int                     `json:"advertiseIntervalSec"` // Advertisement interval
+	QueryTimeoutSec      int                     `json:"queryTimeoutSec"`      // DHT query timeout
+	CacheValidityMin     int                     `json:"cacheValidityMin"`     // Peer cache validity
+	MaxServers           int                     `json:"maxServers"`           // Max cached servers
+	SelectionStrategy    ServerSelectionStrategy `json:"selectionStrategy"`    // Server selection strategy
+	PreferredExitNodes   []string                `json:"preferredExitNodes"`   // Preferred exit node peer IDs
 }
 
 // LoggingConfig contains logging settings
@@ -73,13 +75,12 @@ type LoggingConfig struct {
 // Config represents the complete application configuration
 type Config struct {
 	// Basic settings
-	Mode      string `json:"mode"`      // Node mode: "client" or "server"
+	Mode      string `json:"mode"`      // Node mode: "client", "server", or "bootstrap"
 	DataDir   string `json:"dataDir"`   // Data directory for persistent storage
 	ConfigDir string `json:"configDir"` // Configuration directory
 
 	// Component configurations
 	Network   NetworkConfig   `json:"network"`   // Network settings
-	Auth      AuthConfig      `json:"auth"`      // Authentication settings
 	SOCKS5    SOCKS5Config    `json:"socks5"`    // SOCKS5 proxy settings
 	Relay     RelayConfig     `json:"relay"`     // Relay settings
 	Discovery DiscoveryConfig `json:"discovery"` // Discovery settings
@@ -127,7 +128,6 @@ func NewDefaultConfig() *Config {
 			Port:               4001,
 			BoostrapNodes:      []string{}, // Empty by default - must be provided
 			Name:               "goxic-proxy",
-			Secret:             "", // Must be provided
 			MaxConnections:     400,
 			MinConnections:     100,
 			ConnectionTimeout:  30,
@@ -135,13 +135,6 @@ func NewDefaultConfig() *Config {
 			EnableIPv6:         true,
 			EnableAutoRelay:    true,
 			EnableHolePunching: true,
-		},
-
-		Auth: AuthConfig{
-			Enabled:            true,
-			TimeoutSeconds:     30,
-			ValidityHours:      24,
-			CleanupIntervalMin: 60,
 		},
 
 		SOCKS5: SOCKS5Config{
@@ -161,12 +154,13 @@ func NewDefaultConfig() *Config {
 		},
 
 		Discovery: DiscoveryConfig{
-			UpdateIntervalSec:     30,
-			AdvertiseIntervalSec:  60,
-			QueryTimeoutSec:       10,
-			CacheValidityMin:      10,
-			MaxServers:            50,
-			EnableRandomSelection: false,
+			UpdateIntervalSec:    30,
+			AdvertiseIntervalSec: 60,
+			QueryTimeoutSec:      10,
+			CacheValidityMin:     10,
+			MaxServers:           50,
+			SelectionStrategy:    SelectionLoadBalance, // Default to load balancing
+			PreferredExitNodes:   []string{},           // Empty by default
 		},
 
 		Logging: LoggingConfig{
@@ -203,17 +197,6 @@ func (c *Config) ApplyDefaults() error {
 	}
 	if c.Network.DialTimeout == 0 {
 		c.Network.DialTimeout = defaults.Network.DialTimeout
-	}
-
-	// Apply auth defaults
-	if c.Auth.TimeoutSeconds == 0 {
-		c.Auth.TimeoutSeconds = defaults.Auth.TimeoutSeconds
-	}
-	if c.Auth.ValidityHours == 0 {
-		c.Auth.ValidityHours = defaults.Auth.ValidityHours
-	}
-	if c.Auth.CleanupIntervalMin == 0 {
-		c.Auth.CleanupIntervalMin = defaults.Auth.CleanupIntervalMin
 	}
 
 	// Apply SOCKS5 defaults
@@ -257,6 +240,12 @@ func (c *Config) ApplyDefaults() error {
 	if c.Discovery.MaxServers == 0 {
 		c.Discovery.MaxServers = defaults.Discovery.MaxServers
 	}
+	if c.Discovery.SelectionStrategy == "" {
+		c.Discovery.SelectionStrategy = defaults.Discovery.SelectionStrategy
+	}
+	if c.Discovery.PreferredExitNodes == nil {
+		c.Discovery.PreferredExitNodes = defaults.Discovery.PreferredExitNodes
+	}
 
 	// Apply logging defaults
 	if c.Logging.Level == "" {
@@ -296,14 +285,11 @@ func (c *Config) ApplyDefaults() error {
 // Validate checks configuration for consistency and correctness
 func (c *Config) Validate() error {
 	// Validate mode
-	if c.Mode != "client" && c.Mode != "server" {
-		return fmt.Errorf("invalid mode '%s', must be 'client' or 'server'", c.Mode)
+	if c.Mode != "client" && c.Mode != "server" && c.Mode != "bootstrap" {
+		return fmt.Errorf("invalid mode '%s', must be 'client', 'server', or 'bootstrap'", c.Mode)
 	}
 
 	// Validate required fields
-	if c.Network.Secret == "" {
-		return fmt.Errorf("network.secret is required for authentication")
-	}
 	if len(c.Network.BoostrapNodes) == 0 {
 		return fmt.Errorf("network.boostrapNodes is required for DHT bootstrap")
 	}
@@ -369,6 +355,27 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid logging.format '%s', must be 'text' or 'json'", c.Logging.Format)
 	}
 
+	// Validate discovery selection strategy
+	validStrategies := []ServerSelectionStrategy{
+		SelectionFirst, SelectionRandom, SelectionLoadBalance, SelectionPreferred,
+	}
+	strategyValid := false
+	for _, strategy := range validStrategies {
+		if c.Discovery.SelectionStrategy == strategy {
+			strategyValid = true
+			break
+		}
+	}
+	if !strategyValid {
+		return fmt.Errorf("invalid discovery.selectionStrategy '%s', must be one of: first, random, load_balance, preferred",
+			c.Discovery.SelectionStrategy)
+	}
+
+	// Validate preferred exit nodes (if using preferred strategy)
+	if c.Discovery.SelectionStrategy == SelectionPreferred && len(c.Discovery.PreferredExitNodes) == 0 {
+		return fmt.Errorf("discovery.preferredExitNodes cannot be empty when using 'preferred' selection strategy")
+	}
+
 	return nil
 }
 
@@ -406,4 +413,9 @@ func (c *Config) IsClientMode() bool {
 // IsServerMode returns true if running in server mode
 func (c *Config) IsServerMode() bool {
 	return c.Mode == "server"
+}
+
+// IsBootstrapMode returns true if running in bootstrap-only mode
+func (c *Config) IsBootstrapMode() bool {
+	return c.Mode == "bootstrap"
 }

@@ -24,5 +24,4 @@ type HandlerRegistry interface {
 	StartNodeHandlers(ctx context.Context, node *Node) error
 	StopNodeHandlers() error
 	SetupStreamHandlers(node *Node)
-	GetConnectionGuardInterface() interface{} // Return as interface{} to avoid circular import
 }

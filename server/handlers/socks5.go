@@ -35,26 +35,29 @@ func NewSOCKS5Handler(config *model.SOCKS5Config) *SOCKS5Handler {
 	}
 }
 
+// NewSOCKS5HandlerWithCapabilities creates a new SOCKS5 handler with config and capability manager
+func NewSOCKS5HandlerWithCapabilities(config *model.SOCKS5Config, capabilityManager *CapabilityManager) *SOCKS5Handler {
+	return &SOCKS5Handler{
+		port:              config.Port,
+		config:            config,
+		capabilityManager: capabilityManager,
+	}
+}
+
 // Start initializes and starts the SOCKS5 server
 func (s *SOCKS5Handler) Start(ctx context.Context, node *model.Node) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// Initialize capability manager for client node
-	s.capabilityManager = NewCapabilityManager(node, "client")
-	if err := s.capabilityManager.AdvertiseCapabilities(); err != nil {
-		return fmt.Errorf("failed to advertise capabilities: %w", err)
-	}
-
-	// Get connection guard from registry if available
-	var connectionGuard *ConnectionGuard
-	if guardInterface := node.Registry.GetConnectionGuardInterface(); guardInterface != nil {
-		if guard, ok := guardInterface.(*ConnectionGuard); ok {
-			connectionGuard = guard
+	// Initialize capability manager for client node if not provided
+	if s.capabilityManager == nil {
+		s.capabilityManager = NewCapabilityManager(node, "client")
+		if err := s.capabilityManager.AdvertiseCapabilities(); err != nil {
+			return fmt.Errorf("failed to advertise capabilities: %w", err)
 		}
 	}
 
-	// Initialize server discovery with capability manager and connection guard
-	s.discovery = NewServerDiscovery(node, s.capabilityManager, connectionGuard)
+	// Initialize server discovery with capability manager
+	s.discovery = NewServerDiscovery(node, s.capabilityManager)
 	s.discovery.StartPeriodicDiscovery(ctx)
 
 	addr := fmt.Sprintf("%s:%d", node.Config.SOCKS5.BindAddress, s.port)
@@ -116,9 +119,9 @@ func (s *SOCKS5Handler) handleConnection(conn net.Conn, node *model.Node) {
 
 	atomic.AddInt32(&s.activeConnections, 1)
 
-	// Set connection timeout
-	connectionTimeout := time.Duration(s.config.ConnectionTimeout) * time.Second
-	conn.SetDeadline(time.Now().Add(connectionTimeout))
+	// Set connection timeout only for the initial handshake phase
+	handshakeTimeout := time.Duration(s.config.ConnectionTimeout) * time.Second
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	log.Printf("New SOCKS5 connection from %s (active: %d/%d)",
 		conn.RemoteAddr().String(),
@@ -171,8 +174,16 @@ func (s *SOCKS5Handler) handleConnection(conn net.Conn, node *model.Node) {
 		return
 	}
 
+	// Remove handshake timeout for long-lived connections like SSH
+	conn.SetDeadline(time.Time{})
+	log.Printf("Handshake completed, removing connection timeout for long-lived session")
+
 	// Bridge traffic between SOCKS5 client and libp2p stream
 	s.bridgeTraffic(conn, libp2pStream)
+
+	// Release connection tracking when done
+	s.discovery.ReleaseConnection(serverPeer.ID)
+	log.Printf("Released connection tracking for server: %s", serverPeer.ID)
 }
 
 // handleAuthentication handles SOCKS5 authentication negotiation
@@ -303,11 +314,16 @@ func (s *SOCKS5Handler) createProxyStream(node *model.Node, serverPeer peer.Addr
 	// For direct connection (no relay hops)
 	relayPeers := []peer.ID{serverPeer.ID}
 
+	log.Printf("Creating proxy stream to %s for proxy ID: %s", serverPeer.ID, proxyID)
+
 	// Use the relay handler to create stream
 	stream, err := OpenRelay(node, proxyID, relayPeers)
 	if err != nil {
+		log.Printf("Failed to open relay stream to %s: %v", serverPeer.ID, err)
 		return nil, fmt.Errorf("failed to open relay stream: %w", err)
 	}
+
+	log.Printf("Successfully created proxy stream to %s", serverPeer.ID)
 
 	return stream, nil
 }
@@ -334,8 +350,19 @@ func (s *SOCKS5Handler) sendTargetAddr(stream network.Stream, targetAddr string)
 func (s *SOCKS5Handler) bridgeTraffic(socksConn net.Conn, libp2pStream network.Stream) {
 	done := make(chan error, 2)
 
+	// Configure connection for long-lived sessions like SSH
+	if tcpConn, ok := socksConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(time.Second * 30)
+		tcpConn.SetNoDelay(true) // Disable Nagle's algorithm for interactive sessions
+	}
+
 	// SOCKS5 -> libp2p
 	go func() {
+		defer func() {
+			libp2pStream.CloseWrite()
+			log.Printf("SOCKS5 -> libp2p direction closed")
+		}()
 		_, err := io.Copy(libp2pStream, socksConn)
 		if err != nil {
 			log.Printf("SOCKS5 -> libp2p copy error: %v", err)
@@ -345,6 +372,12 @@ func (s *SOCKS5Handler) bridgeTraffic(socksConn net.Conn, libp2pStream network.S
 
 	// libp2p -> SOCKS5
 	go func() {
+		defer func() {
+			if tcpConn, ok := socksConn.(*net.TCPConn); ok {
+				tcpConn.CloseWrite()
+			}
+			log.Printf("libp2p -> SOCKS5 direction closed")
+		}()
 		_, err := io.Copy(socksConn, libp2pStream)
 		if err != nil {
 			log.Printf("libp2p -> SOCKS5 copy error: %v", err)
@@ -353,7 +386,14 @@ func (s *SOCKS5Handler) bridgeTraffic(socksConn net.Conn, libp2pStream network.S
 	}()
 
 	// Wait for either direction to complete
-	<-done
+	err := <-done
+	if err != nil {
+		log.Printf("Bridge completed with error: %v", err)
+	}
+
+	// Ensure cleanup
+	socksConn.Close()
+	libp2pStream.Close()
 
 	log.Printf("Proxy connection closed")
 }

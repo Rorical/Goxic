@@ -36,7 +36,14 @@ func NewRelayHandler() *RelayHandler {
 
 // Protocol returns the protocol pattern this handler supports
 func (h *RelayHandler) Protocol() string {
-	return `/Goxic/relay/.*`
+	return `/Goxic/relay/` + Version
+}
+
+// ProtocolMatch returns the protocol matcher function for SetStreamHandlerMatch
+func (h *RelayHandler) ProtocolMatch() func(protocol.ID) bool {
+	return func(proto protocol.ID) bool {
+		return h.pattern.MatchString(string(proto))
+	}
 }
 
 // Handle processes incoming relay streams
@@ -102,24 +109,36 @@ func (h *RelayHandler) forwardToNextPeer(income network.Stream, node *model.Node
 	defer outcome.Close()
 	outcome.Scope().SetService(ServiceName)
 
-	// Bidirectional relay
+	// Bidirectional relay with proper cleanup
 	done := make(chan error, 2)
 
 	go func() {
+		defer outcome.CloseWrite()
 		_, err := io.Copy(outcome, income)
+		if err != nil {
+			log.Printf("income -> outcome relay error: %v", err)
+		}
 		done <- err
 	}()
 
 	go func() {
+		defer income.CloseWrite()
 		_, err := io.Copy(income, outcome)
+		if err != nil {
+			log.Printf("outcome -> income relay error: %v", err)
+		}
 		done <- err
 	}()
 
 	// Wait for either direction to complete
 	err = <-done
 	if err != nil {
-		log.Printf("Relay error: %v", err)
+		log.Printf("Relay forwarding completed with error: %v", err)
 	}
+
+	// Ensure both streams are closed
+	outcome.Close()
+	income.Close()
 
 	return err
 }
@@ -144,6 +163,13 @@ func (h *RelayHandler) handleProxyTraffic(stream network.Stream, node *model.Nod
 		return err
 	}
 	defer targetConn.Close()
+
+	// Configure connection for long-lived sessions (like SSH)
+	if tcpConn, ok := targetConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(time.Second * 30)
+		tcpConn.SetNoDelay(true) // Disable Nagle's algorithm for interactive sessions
+	}
 
 	log.Printf("Successfully connected to target: %s", targetAddr)
 
@@ -177,8 +203,19 @@ func (h *RelayHandler) readTargetAddr(stream network.Stream) (string, error) {
 func (h *RelayHandler) bridgeExitTraffic(libp2pStream network.Stream, targetConn net.Conn) error {
 	done := make(chan error, 2)
 
+	// Remove any existing deadlines to prevent timeouts on long-lived connections
+	libp2pStream.SetDeadline(time.Time{})
+	targetConn.SetDeadline(time.Time{})
+
+	log.Printf("Starting traffic bridge for long-lived connection")
+
 	// libp2p -> target
 	go func() {
+		defer func() {
+			if tcpConn, ok := targetConn.(*net.TCPConn); ok {
+				tcpConn.CloseWrite() // Signal end of writes
+			}
+		}()
 		_, err := io.Copy(targetConn, libp2pStream)
 		if err != nil {
 			log.Printf("libp2p -> target copy error: %v", err)
@@ -188,6 +225,9 @@ func (h *RelayHandler) bridgeExitTraffic(libp2pStream network.Stream, targetConn
 
 	// target -> libp2p
 	go func() {
+		defer func() {
+			libp2pStream.CloseWrite() // Signal end of writes
+		}()
 		_, err := io.Copy(libp2pStream, targetConn)
 		if err != nil {
 			log.Printf("target -> libp2p copy error: %v", err)
@@ -197,6 +237,10 @@ func (h *RelayHandler) bridgeExitTraffic(libp2pStream network.Stream, targetConn
 
 	// Wait for either direction to complete
 	err := <-done
+
+	// Close both connections to ensure cleanup
+	targetConn.Close()
+	libp2pStream.Close()
 
 	log.Printf("Exit connection closed for target")
 	return err

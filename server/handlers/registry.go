@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"log"
 	"regexp"
 
 	"github.com/Rorical/Goxic/server/model"
@@ -27,34 +28,17 @@ type NodeHandler interface {
 
 // Registry manages protocol handlers and node handlers
 type Registry struct {
-	streamHandlers  map[string]Handler
-	nodeHandlers    []NodeHandler
-	patterns        map[string]*regexp.Regexp
-	connectionGuard *ConnectionGuard
-	authEnabled     bool
+	streamHandlers map[string]Handler
+	nodeHandlers   []NodeHandler
+	patterns       map[string]*regexp.Regexp
 }
 
 // NewRegistry creates a new handler registry
 func NewRegistry() *Registry {
 	return &Registry{
-		streamHandlers:  make(map[string]Handler),
-		nodeHandlers:    make([]NodeHandler, 0),
-		patterns:        make(map[string]*regexp.Regexp),
-		connectionGuard: nil,
-		authEnabled:     false,
-	}
-}
-
-// NewRegistryWithAuth creates a new handler registry with authentication enabled
-func NewRegistryWithAuth(node *model.Node, secret string) *Registry {
-	guard := NewConnectionGuard(node, secret)
-
-	return &Registry{
-		streamHandlers:  make(map[string]Handler),
-		nodeHandlers:    make([]NodeHandler, 0),
-		patterns:        make(map[string]*regexp.Regexp),
-		connectionGuard: guard,
-		authEnabled:     true,
+		streamHandlers: make(map[string]Handler),
+		nodeHandlers:   make([]NodeHandler, 0),
+		patterns:       make(map[string]*regexp.Regexp),
 	}
 }
 
@@ -121,58 +105,27 @@ func (r *Registry) StopNodeHandlers() error {
 
 // SetupStreamHandlers registers all stream handlers with the libp2p host
 func (r *Registry) SetupStreamHandlers(node *model.Node) {
-	if r.authEnabled && r.connectionGuard != nil {
-		// Set up authentication-protected stream handling
-		originalHandler := func(stream network.Stream) {
-			handler, found := r.GetStreamHandler(stream.Protocol())
-			if found {
-				go func() {
-					defer stream.Close()
-					if err := handler.Handle(stream, node); err != nil {
-						stream.Reset()
-					}
-				}()
-			} else {
-				stream.Reset()
-			}
+	// Register each protocol with libp2p directly
+	for protocolPattern, handler := range r.streamHandlers {
+		streamHandler := func(stream network.Stream) {
+			go func() {
+				defer stream.Close()
+				if err := handler.Handle(stream, node); err != nil {
+					stream.Reset()
+				}
+			}()
 		}
 
-		r.connectionGuard.SetOriginalHandler(originalHandler)
-		node.Host.SetStreamHandler("", r.connectionGuard.GuardedStreamHandler)
-
-		// Set up network notifiee for connection events
-		notifiee := NewAuthNetworkNotifiee(r.connectionGuard)
-		node.Host.Network().Notify(notifiee)
-
-		// Start periodic cleanup
-		r.connectionGuard.StartPeriodicCleanup(node.CTX)
-
-		// Authenticate already connected peers
-		r.connectionGuard.AuthenticateConnectedPeers(node.CTX)
-	} else {
-		// Set a general stream handler that routes to specific handlers (no auth)
-		node.Host.SetStreamHandler("", func(stream network.Stream) {
-			handler, found := r.GetStreamHandler(stream.Protocol())
-			if found {
-				go func() {
-					defer stream.Close()
-					if err := handler.Handle(stream, node); err != nil {
-						stream.Reset()
-					}
-				}()
-			} else {
-				stream.Reset()
-			}
-		})
+		// Check if this is a relay handler that needs pattern matching
+		if relayHandler, ok := handler.(*RelayHandler); ok {
+			// Use SetStreamHandlerMatch for pattern-based protocols
+			matchFunc := relayHandler.ProtocolMatch()
+			node.Host.SetStreamHandlerMatch(protocol.ID(protocolPattern), matchFunc, streamHandler)
+			log.Printf("Registered relay protocol with pattern matching: %s", protocolPattern)
+		} else {
+			// For exact protocols, register directly
+			node.Host.SetStreamHandler(protocol.ID(protocolPattern), streamHandler)
+			log.Printf("Registered exact protocol: %s", protocolPattern)
+		}
 	}
-}
-
-// GetConnectionGuard returns the connection guard (if authentication is enabled)
-func (r *Registry) GetConnectionGuard() *ConnectionGuard {
-	return r.connectionGuard
-}
-
-// GetConnectionGuard for interface compliance - returns as interface{}
-func (r *Registry) GetConnectionGuardInterface() interface{} {
-	return r.connectionGuard
 }

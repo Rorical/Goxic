@@ -117,6 +117,7 @@ func (cm *CapabilityManager) queryPeerCapabilities(peerID peer.ID) (*NodeCapabil
 	// Try to create stream for capability exchange
 	stream, err := cm.node.Host.NewStream(ctx, peerID, protocol.ID(CapabilityProtocol))
 	if err != nil {
+		log.Printf("Failed to create capability exchange stream with %s: %v", peerID, err)
 		// If capability protocol is not supported, try to infer from other means
 		return cm.inferPeerCapabilities(peerID)
 	}
@@ -172,21 +173,34 @@ func (cm *CapabilityManager) inferPeerCapabilities(peerID peer.ID) (*NodeCapabil
 	capabilities := make([]NodeCapability, 0)
 	nodeType := "unknown"
 
-	// Test for relay capability by trying to create a relay stream
-	if cm.testProtocolSupport(ctx, peerID, "/Goxic/relay/.*") {
+	// Test for relay capability
+	hasRelay := cm.testProtocolSupport(ctx, peerID, "/Goxic/relay/.*")
+	if hasRelay {
 		capabilities = append(capabilities, CapabilityRelay)
-
-		// If relay is supported, this could be either client or server
-		// Try to determine by testing other indicators
-		if cm.testProtocolSupport(ctx, peerID, "/goxic/auth/.*") {
-			// Has auth protocol, likely a full node
-			// Check if it responds to capability queries to determine type
-			nodeType = "server" // Assume server if it has auth but no SOCKS5
-			capabilities = append(capabilities, CapabilityExitNode)
-		}
 	}
 
-	// If we can't determine capabilities, return minimal set
+	// Try to determine if this is a client or server based on multiple factors
+	// Since we can't easily test for SOCKS5 (it's a node handler, not stream protocol),
+	// we'll use heuristics:
+
+	// 1. Check if peer has capability exchange protocol - indicates full node
+	hasCapabilityExchange := cm.testProtocolSupport(ctx, peerID, "/goxic/capability-exchange/.*")
+
+	// 2. Be optimistic about relay-capable peers since capability exchange might be failing
+	if hasCapabilityExchange && hasRelay {
+		// Peer supports capability exchange and relay - likely a full server node
+		nodeType = "server"
+		capabilities = append(capabilities, CapabilityExitNode)
+		log.Printf("Peer %s has relay + capability exchange - assuming server with exit capability", peerID)
+	} else if hasRelay {
+		// Has relay but no capability exchange - could still be a server
+		// Be optimistic since exact capability determination is failing
+		nodeType = "server"
+		capabilities = append(capabilities, CapabilityExitNode)
+		log.Printf("Peer %s has relay capability - optimistically assuming exit capability", peerID)
+	}
+
+	// If we can't determine capabilities, return minimal safe set
 	if len(capabilities) == 0 {
 		capabilities = []NodeCapability{CapabilityRelay}
 		nodeType = "unknown"
@@ -198,12 +212,12 @@ func (cm *CapabilityManager) inferPeerCapabilities(peerID peer.ID) (*NodeCapabil
 		NodeType:     nodeType,
 	}
 
-	// Cache inferred capabilities with shorter TTL
+	// Cache inferred capabilities but mark them as uncertain
 	if err := cm.UpdatePeerCapabilities(peerID, *inferredCapabilities); err != nil {
 		log.Printf("Failed to cache inferred capabilities for peer %s: %v", peerID, err)
 	}
 
-	log.Printf("Inferred capabilities for peer %s: %v", peerID, capabilities)
+	log.Printf("Inferred capabilities for peer %s: %v (node_type: %s)", peerID, capabilities, nodeType)
 	return inferredCapabilities, nil
 }
 
@@ -223,8 +237,8 @@ func (cm *CapabilityManager) testProtocolSupport(ctx context.Context, peerID pee
 			if strings.HasPrefix(string(proto), "/Goxic/relay/") {
 				return true
 			}
-		} else if protocolPattern == "/goxic/auth/.*" {
-			if strings.HasPrefix(string(proto), "/goxic/auth/") {
+		} else if protocolPattern == "/goxic/capability-exchange/.*" {
+			if strings.HasPrefix(string(proto), "/goxic/capability-exchange/") {
 				return true
 			}
 		} else if string(proto) == protocolPattern {
@@ -284,13 +298,23 @@ func (cm *CapabilityManager) GetOurCapabilities() NodeCapabilities {
 
 // StartCapabilityExchange starts exchanging capabilities with connected peers
 func (cm *CapabilityManager) StartCapabilityExchange(ctx context.Context) {
-	// TODO: Implement periodic capability exchange with connected peers
-	// This could involve:
-	// 1. Custom libp2p protocol for capability exchange
-	// 2. DHT record publishing/subscribing
-	// 3. PubSub messaging for capability updates
-
 	log.Printf("Capability exchange started for node type: %s", cm.capabilities.NodeType)
+
+	// Start a goroutine to periodically exchange capabilities with connected peers
+	go func() {
+		ticker := time.NewTicker(time.Minute * 2) // Exchange capabilities every 2 minutes
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("Capability exchange stopped")
+				return
+			case <-ticker.C:
+				cm.exchangeWithConnectedPeers(ctx)
+			}
+		}
+	}()
 }
 
 // ConnectedServers returns currently connected peers that can act as exit nodes
@@ -307,4 +331,25 @@ func (cm *CapabilityManager) ConnectedServers() []peer.AddrInfo {
 	}
 
 	return serverPeers
+}
+
+// exchangeWithConnectedPeers exchanges capabilities with all connected peers
+func (cm *CapabilityManager) exchangeWithConnectedPeers(ctx context.Context) {
+	connectedPeers := cm.node.Host.Network().Peers()
+
+	for _, peerID := range connectedPeers {
+		// Skip if we already have recent capability information
+		if capabilities, err := cm.GetPeerCapabilities(peerID); err == nil && capabilities != nil {
+			continue // We already know this peer's capabilities
+		}
+
+		// Try to exchange capabilities with this peer
+		go func(pid peer.ID) {
+			if caps, err := cm.queryPeerCapabilities(pid); err == nil && caps != nil {
+				log.Printf("Exchanged capabilities with peer %s: %v", pid, caps.Capabilities)
+			} else {
+				log.Printf("Failed to exchange capabilities with peer %s: %v", pid, err)
+			}
+		}(peerID)
+	}
 }

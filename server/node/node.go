@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"path"
 	"sync"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -97,10 +97,7 @@ func Run(ctx context.Context, config *model.Config) (*model.Node, error) {
 		libp2p.WithDialTimeout(time.Duration(config.Network.DialTimeout) * time.Second),
 	}
 
-	// Add optional features based on config
-	if config.Network.EnableAutoRelay {
-		libp2pOpts = append(libp2pOpts, libp2p.EnableAutoRelay())
-	}
+	// Auto-relay configuration will be added after DHT is created
 
 	if config.Network.EnableHolePunching {
 		libp2pOpts = append(libp2pOpts, libp2p.EnableHolePunching())
@@ -121,6 +118,55 @@ func Run(ctx context.Context, config *model.Config) (*model.Node, error) {
 
 	// print the node's public key
 	log.Println("Public Key:", h.Peerstore().PubKey(h.ID()))
+
+	// Configure auto-relay with DHT-based peer source if enabled
+	if config.Network.EnableAutoRelay {
+		log.Println("Configuring auto-relay with DHT peer source...")
+
+		// Create a peer source function that uses DHT to find relay nodes
+		peerSource := func(ctx context.Context, num int) <-chan peer.AddrInfo {
+			ch := make(chan peer.AddrInfo, num)
+			go func() {
+				defer close(ch)
+
+				// Use DHT to find peers that support relay protocol
+				peerChan, err := drouting.NewRoutingDiscovery(idht).FindPeers(ctx, "libp2p-relay")
+				if err != nil {
+					log.Printf("Failed to discover relay peers: %v", err)
+					return
+				}
+
+				count := 0
+				for peer := range peerChan {
+					if count >= num {
+						break
+					}
+
+					// Only include peers that are not ourselves
+					if peer.ID != h.ID() {
+						select {
+						case ch <- peer:
+							count++
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+			}()
+			return ch
+		}
+
+		// Enable auto-relay with the peer source and minimum interval
+		_, err = autorelay.NewAutoRelay(h,
+			autorelay.WithPeerSource(peerSource),
+			autorelay.WithMinInterval(1*time.Minute),
+		)
+		if err != nil {
+			log.Printf("Failed to enable auto-relay: %v", err)
+		} else {
+			log.Println("Auto-relay enabled with DHT peer source")
+		}
+	}
 
 	var wg sync.WaitGroup
 	for _, addr := range bootNodesAddrs {

@@ -49,7 +49,6 @@ func main() {
 		}
 		fmt.Printf("Generated default configuration at: %s\n", *configPath)
 		fmt.Println("Please edit the configuration file and set required values:")
-		fmt.Println("  - network.secret: Shared secret for authentication")
 		fmt.Println("  - network.boostrapNodes: Bootstrap node addresses")
 		os.Exit(0)
 	}
@@ -62,8 +61,8 @@ func main() {
 
 	// Override mode from command line if provided
 	if *mode != "" {
-		if *mode != "client" && *mode != "server" {
-			log.Fatalf("Invalid mode '%s', must be 'client' or 'server'", *mode)
+		if *mode != "client" && *mode != "server" && *mode != "bootstrap" {
+			log.Fatalf("Invalid mode '%s', must be 'client', 'server', or 'bootstrap'", *mode)
 		}
 		config.Mode = *mode
 		log.Printf("Mode overridden from command line: %s", *mode)
@@ -89,6 +88,8 @@ func main() {
 	nodeType := node.NodeTypeClient
 	if config.IsServerMode() {
 		nodeType = node.NodeTypeServer
+	} else if config.IsBootstrapMode() {
+		nodeType = node.NodeTypeServer // Use server type for bootstrap (no SOCKS5)
 	}
 
 	log.Printf("Initializing %s node...", nodeType)
@@ -109,8 +110,11 @@ func main() {
 			log.Printf("Configure your applications to use SOCKS5 proxy: %s:%d",
 				config.SOCKS5.BindAddress, config.SOCKS5.Port)
 		}
-	} else {
+	} else if config.IsServerMode() {
 		log.Printf("Server node ready to handle proxy traffic")
+	} else if config.IsBootstrapMode() {
+		log.Printf("Bootstrap node ready - providing DHT services for peer discovery")
+		log.Printf("This node will NOT handle proxy traffic or authentication")
 	}
 
 	// Wait for shutdown signal
@@ -142,13 +146,13 @@ func printHelp() {
 	fmt.Printf("  %s -config=/path/to/config.json -mode=server\n\n", os.Args[0])
 	fmt.Println("Configuration:")
 	fmt.Println("  The configuration file is required and must contain:")
-	fmt.Println("  - network.secret: Shared authentication secret")
 	fmt.Println("  - network.boostrapNodes: List of bootstrap node addresses")
 	fmt.Println("  - network.name: Network service name (default: goxic-proxy)")
 	fmt.Println()
 	fmt.Println("Node Modes:")
 	fmt.Println("  client: Runs SOCKS5 proxy locally, routes traffic through servers")
 	fmt.Println("  server: Handles traffic egress, can relay for other nodes")
+	fmt.Println("  bootstrap: Pure DHT node for discovery only (no proxy, no auth)")
 }
 
 // generateDefaultConfig creates a default configuration file
@@ -163,14 +167,14 @@ func generateDefaultConfig(configPath string) error {
 	// Generate default config
 	config := model.NewDefaultConfig()
 
-	// Add example bootstrap nodes (user should replace these)
+	// Add default IPFS bootstrap nodes
 	config.Network.BoostrapNodes = []string{
-		"/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWReplace WithActualBootstrapNode1",
-		"/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWReplace WithActualBootstrapNode2",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+		"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 	}
-
-	// Set placeholder secret
-	config.Network.Secret = "CHANGE-THIS-TO-YOUR-SHARED-SECRET"
 
 	// Save configuration
 	return config.SaveConfig(configPath)
