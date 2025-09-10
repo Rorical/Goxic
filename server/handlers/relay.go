@@ -27,8 +27,8 @@ type RelayHandler struct {
 
 // NewRelayHandler creates a new relay handler
 func NewRelayHandler() *RelayHandler {
-	// Pattern: /Goxic/relay/1.0.0/proxy/[proxy-id]/next/[peer-id]/next/[peer-id]...
-	pattern := regexp.MustCompile(`^/Goxic/relay/([^/]+)/proxy/([^/]+)(?:/next/(.+))?$`)
+	// Pattern: /goxic-proxy/relay/1.0.0/proxy/[proxy-id]/next/[peer-id]/next/[peer-id]...
+	pattern := regexp.MustCompile(`^/goxic-proxy/relay/([^/]+)/proxy/([^/]+)(?:/next/(.+))?$`)
 	return &RelayHandler{
 		pattern: pattern,
 	}
@@ -36,7 +36,7 @@ func NewRelayHandler() *RelayHandler {
 
 // Protocol returns the protocol pattern this handler supports
 func (h *RelayHandler) Protocol() string {
-	return `/Goxic/relay/` + Version
+	return `/goxic-proxy/relay/` + Version
 }
 
 // ProtocolMatch returns the protocol matcher function for SetStreamHandlerMatch
@@ -91,7 +91,7 @@ func (h *RelayHandler) forwardToNextPeer(income network.Stream, node *model.Node
 	log.Printf("Forwarding to next peer: %s", nextPeerID.String())
 
 	// Rebuild protocol ID for the next hop
-	protocolID := fmt.Sprintf("/Goxic/relay/%s/proxy/%s", version, proxyID)
+	protocolID := fmt.Sprintf("/goxic-proxy/relay/%s/proxy/%s", version, proxyID)
 	if len(nextPeers) > 1 {
 		for _, peerID := range nextPeers[1:] {
 			if peerID != "" {
@@ -257,7 +257,7 @@ func OpenRelay(node *model.Node, proxyID string, relayPeers []peer.ID) (network.
 	firstPeerID = relayPeers[0]
 
 	// Build protocol ID
-	protocolID := fmt.Sprintf("/Goxic/relay/%s/proxy/%s", Version, proxyID)
+	protocolID := fmt.Sprintf("/goxic-proxy/relay/%s/proxy/%s", Version, proxyID)
 	if len(relayPeers) > 1 {
 		for _, peerID := range relayPeers[1:] {
 			protocolID += fmt.Sprintf("/next/%s", peerID.String())

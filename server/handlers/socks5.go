@@ -22,7 +22,6 @@ type SOCKS5Handler struct {
 	cancel            context.CancelFunc
 	port              int
 	discovery         *ServerDiscovery
-	capabilityManager *CapabilityManager
 	activeConnections int32 // Current number of active connections
 	config            *model.SOCKS5Config
 }
@@ -36,11 +35,10 @@ func NewSOCKS5Handler(config *model.SOCKS5Config) *SOCKS5Handler {
 }
 
 // NewSOCKS5HandlerWithCapabilities creates a new SOCKS5 handler with config and capability manager
-func NewSOCKS5HandlerWithCapabilities(config *model.SOCKS5Config, capabilityManager *CapabilityManager) *SOCKS5Handler {
+func NewSOCKS5HandlerWithCapabilities(config *model.SOCKS5Config) *SOCKS5Handler {
 	return &SOCKS5Handler{
-		port:              config.Port,
-		config:            config,
-		capabilityManager: capabilityManager,
+		port:   config.Port,
+		config: config,
 	}
 }
 
@@ -48,17 +46,9 @@ func NewSOCKS5HandlerWithCapabilities(config *model.SOCKS5Config, capabilityMana
 func (s *SOCKS5Handler) Start(ctx context.Context, node *model.Node) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// Initialize capability manager for client node if not provided
-	if s.capabilityManager == nil {
-		s.capabilityManager = NewCapabilityManager(node, "client")
-		if err := s.capabilityManager.AdvertiseCapabilities(); err != nil {
-			return fmt.Errorf("failed to advertise capabilities: %w", err)
-		}
-	}
-
-	// Initialize server discovery with capability manager
-	s.discovery = NewServerDiscovery(node, s.capabilityManager)
-	s.discovery.StartPeriodicDiscovery(ctx)
+	// Initialize server discovery for on-demand server finding
+	// Note: Client nodes discover servers on-demand, not via persistent mesh connections
+	s.discovery = NewServerDiscovery(node)
 
 	addr := fmt.Sprintf("%s:%d", node.Config.SOCKS5.BindAddress, s.port)
 	listener, err := net.Listen("tcp", addr)
@@ -176,7 +166,6 @@ func (s *SOCKS5Handler) handleConnection(conn net.Conn, node *model.Node) {
 
 	// Remove handshake timeout for long-lived connections like SSH
 	conn.SetDeadline(time.Time{})
-	log.Printf("Handshake completed, removing connection timeout for long-lived session")
 
 	// Bridge traffic between SOCKS5 client and libp2p stream
 	s.bridgeTraffic(conn, libp2pStream)

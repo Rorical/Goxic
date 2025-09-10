@@ -68,22 +68,9 @@ func SetupNode(ctx context.Context, config *model.Config, nodeType NodeType) (*m
 
 // setupClientHandlers configures handlers for client nodes
 func setupClientHandlers(ctx context.Context, node *model.Node, registry *handlers.Registry) error {
-	// Initialize capability manager for client node
-	capabilityManager := handlers.NewCapabilityManager(node, "client")
-	if err := capabilityManager.AdvertiseCapabilities(); err != nil {
-		return fmt.Errorf("failed to advertise client capabilities: %w", err)
-	}
-
-	// Start capability exchange
-	capabilityManager.StartCapabilityExchange(ctx)
-
-	// Register capability exchange protocol handler
-	capabilityProtocolHandler := handlers.NewCapabilityProtocolHandler(capabilityManager)
-	registry.RegisterStreamHandler(capabilityProtocolHandler)
-
 	// Client nodes run SOCKS5 proxy locally if enabled
 	if node.Config.SOCKS5.Enabled {
-		socks5Handler := handlers.NewSOCKS5HandlerWithCapabilities(&node.Config.SOCKS5, capabilityManager)
+		socks5Handler := handlers.NewSOCKS5HandlerWithCapabilities(&node.Config.SOCKS5)
 		registry.RegisterNodeHandler(socks5Handler)
 	}
 
@@ -98,19 +85,6 @@ func setupClientHandlers(ctx context.Context, node *model.Node, registry *handle
 
 // setupServerHandlers configures handlers for server nodes
 func setupServerHandlers(ctx context.Context, node *model.Node, registry *handlers.Registry) error {
-	// Initialize capability manager for server node
-	capabilityManager := handlers.NewCapabilityManager(node, "server")
-	if err := capabilityManager.AdvertiseCapabilities(); err != nil {
-		return fmt.Errorf("failed to advertise server capabilities: %w", err)
-	}
-
-	// Start capability exchange
-	capabilityManager.StartCapabilityExchange(ctx)
-
-	// Register capability exchange protocol handler
-	capabilityProtocolHandler := handlers.NewCapabilityProtocolHandler(capabilityManager)
-	registry.RegisterStreamHandler(capabilityProtocolHandler)
-
 	// Server nodes handle relay protocol for traffic routing and exit if enabled
 	if node.Config.Relay.Enabled {
 		relayHandler := handlers.NewRelayHandler()
@@ -121,6 +95,15 @@ func setupServerHandlers(ctx context.Context, node *model.Node, registry *handle
 		}
 	} else {
 		log.Printf("Relay functionality disabled in config")
+	}
+
+	// Server nodes need server discovery to actively find and connect to other servers
+	if node.Config.Discovery.UpdateIntervalSec > 0 {
+		serverDiscovery := handlers.NewServerDiscovery(node)
+		registry.RegisterNodeHandler(serverDiscovery)
+		log.Printf("Server-to-server discovery enabled with interval: %ds", node.Config.Discovery.UpdateIntervalSec)
+	} else {
+		log.Printf("Server discovery disabled (updateIntervalSec = 0)")
 	}
 
 	return nil

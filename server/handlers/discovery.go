@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"sort"
 	"sync"
 	"time"
 
@@ -25,28 +24,30 @@ type ServerLoadInfo struct {
 
 // ServerDiscovery manages discovery of available server nodes
 type ServerDiscovery struct {
-	node              *model.Node
-	routingDiscovery  *drouting.RoutingDiscovery
-	serverPeers       []peer.AddrInfo
-	lastUpdate        time.Time
-	updateInterval    time.Duration
-	capabilityManager *CapabilityManager
+	node             *model.Node
+	routingDiscovery *drouting.RoutingDiscovery
+	serverPeers      []peer.AddrInfo
+	lastUpdate       time.Time
+	updateInterval   time.Duration
 	// Load balancing
 	serverLoads map[peer.ID]*ServerLoadInfo
 	loadMutex   sync.RWMutex
+	// NodeHandler interface support
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+	started   bool
 }
 
 // NewServerDiscovery creates a new server discovery instance
-func NewServerDiscovery(node *model.Node, capabilityManager *CapabilityManager) *ServerDiscovery {
+func NewServerDiscovery(node *model.Node) *ServerDiscovery {
 	updateInterval := time.Duration(node.Config.Discovery.UpdateIntervalSec) * time.Second
 	return &ServerDiscovery{
-		node:              node,
-		routingDiscovery:  drouting.NewRoutingDiscovery(node.Router),
-		serverPeers:       make([]peer.AddrInfo, 0),
-		updateInterval:    updateInterval,
-		capabilityManager: capabilityManager,
-		serverLoads:       make(map[peer.ID]*ServerLoadInfo),
-		loadMutex:         sync.RWMutex{},
+		node:             node,
+		routingDiscovery: drouting.NewRoutingDiscovery(node.Router),
+		serverPeers:      make([]peer.AddrInfo, 0),
+		updateInterval:   updateInterval,
+		serverLoads:      make(map[peer.ID]*ServerLoadInfo),
+		loadMutex:        sync.RWMutex{},
 	}
 }
 
@@ -54,13 +55,24 @@ func NewServerDiscovery(node *model.Node, capabilityManager *CapabilityManager) 
 func (sd *ServerDiscovery) GetAvailableServers(ctx context.Context) ([]peer.AddrInfo, error) {
 	// Refresh if cache is stale
 	if time.Since(sd.lastUpdate) > sd.updateInterval {
-		if err := sd.refreshServerList(ctx); err != nil {
-			log.Printf("Failed to refresh server list: %v", err)
+		// Determine if this is being called by a client (via SOCKS5) or server (via mesh)
+		// If ServerDiscovery was not started via Start() method, it's client-side usage
+		var refreshErr error
+		if !sd.started {
+			// Client-side discovery: don't filter out "client" nodes
+			refreshErr = sd.refreshServerListForClient(ctx)
+		} else {
+			// Server-side discovery: filter to maintain server mesh
+			refreshErr = sd.refreshServerList(ctx)
+		}
+
+		if refreshErr != nil {
+			log.Printf("Failed to refresh server list: %v", refreshErr)
 			// Return cached list even if refresh failed
 		}
 	}
 
-	// Filter out disconnected peers and non-server nodes
+	// Filter peers based on usage context (client vs server)
 	availableServers := make([]peer.AddrInfo, 0)
 	for _, server := range sd.serverPeers {
 		// Skip self
@@ -70,43 +82,33 @@ func (sd *ServerDiscovery) GetAvailableServers(ctx context.Context) ([]peer.Addr
 
 		// Check if we're still connected
 		if sd.node.Host.Network().Connectedness(server.ID) != 1 { // Not connected
+			log.Printf("Peer %s no longer connected, skipping", server.ID)
 			continue
 		}
 
-		// Check if peer has exit node capability
-		hasExitCapability := false
-		if sd.capabilityManager != nil {
-			capabilities, err := sd.capabilityManager.GetPeerCapabilities(server.ID)
-			if err == nil && capabilities != nil {
-				// We have explicit capability information
-				hasExitCapability = sd.capabilityManager.HasCapability(server.ID, CapabilityExitNode)
-				log.Printf("Server %s has known capabilities: %v (exit_node: %t)",
-					server.ID, capabilities.Capabilities, hasExitCapability)
-			} else {
-				// No capability information available, try to get it
-				log.Printf("Server %s capabilities unknown, attempting capability exchange", server.ID)
-
-				// Try capability query for newly discovered peers
-				go func(peerID peer.ID) {
-					if caps, err := sd.capabilityManager.queryPeerCapabilities(peerID); err == nil && caps != nil {
-						log.Printf("Successfully retrieved capabilities for %s: %v", peerID, caps.Capabilities)
-					}
-				}(server.ID)
-
-				// For newly discovered peers, be optimistic but mark as uncertain
-				log.Printf("Server %s capabilities unknown, temporarily allowing for capability discovery", server.ID)
-				hasExitCapability = true // Temporarily allow - will be refined after capability exchange
+		// For server-to-server mesh, filter to only exit-capable servers
+		// For client usage, include all connected peers and let protocol negotiation handle the rest
+		if sd.started {
+			// Server mesh mode: only include exit-capable servers
+			if !sd.isExitCapableServer(server.ID) {
+				log.Printf("Server %s no longer supports relay protocol, filtering out", server.ID)
+				continue
 			}
+			log.Printf("Server mesh: including exit-capable server %s", server.ID)
 		} else {
-			// No capability manager, assume all connected peers could be servers
-			hasExitCapability = true
-		}
-
-		if !hasExitCapability {
-			continue
+			// Client mode: include all connected peers
+			log.Printf("Client mode: including peer %s (protocol verification during connection)", server.ID)
 		}
 
 		availableServers = append(availableServers, server)
+	}
+
+	if sd.started {
+		log.Printf("GetAvailableServers (server mesh): returning %d exit-capable servers from %d cached servers",
+			len(availableServers), len(sd.serverPeers))
+	} else {
+		log.Printf("GetAvailableServers (client mode): returning %d peers from %d cached peers",
+			len(availableServers), len(sd.serverPeers))
 	}
 
 	return availableServers, nil
@@ -164,33 +166,33 @@ func (sd *ServerDiscovery) selectRandomServer(servers []peer.AddrInfo) (*peer.Ad
 
 // selectLoadBalancedServer selects server with lowest load
 func (sd *ServerDiscovery) selectLoadBalancedServer(servers []peer.AddrInfo) (*peer.AddrInfo, error) {
-	sd.loadMutex.RLock()
-	defer sd.loadMutex.RUnlock()
-
 	var bestServer *peer.AddrInfo
-	bestLoad := int(^uint(0) >> 1) // Max int
+	bestLoad := int(^uint(0) >> 1)
+	func() {
+		sd.loadMutex.RLock()
+		defer sd.loadMutex.RUnlock()
 
-	for i := range servers {
-		server := &servers[i]
-		loadInfo, exists := sd.serverLoads[server.ID]
+		for i := range servers {
+			server := &servers[i]
+			loadInfo, exists := sd.serverLoads[server.ID]
 
-		currentLoad := 0
-		if exists {
-			currentLoad = loadInfo.ActiveConns
+			currentLoad := 0
+			if exists {
+				currentLoad = loadInfo.ActiveConns
+			}
+
+			if currentLoad < bestLoad {
+				bestLoad = currentLoad
+				bestServer = server
+			}
+
+			log.Printf("Server %s load: %d active connections", server.ID, currentLoad)
 		}
 
-		if currentLoad < bestLoad {
-			bestLoad = currentLoad
-			bestServer = server
+		if bestServer == nil {
+			bestServer = &servers[0] // Fallback
 		}
-
-		log.Printf("Server %s load: %d active connections", server.ID, currentLoad)
-	}
-
-	if bestServer == nil {
-		bestServer = &servers[0] // Fallback
-	}
-
+	}()
 	sd.TrackConnection(bestServer.ID)
 	log.Printf("Selected load-balanced server: %s (load: %d)", bestServer.ID, bestLoad)
 	return bestServer, nil
@@ -290,6 +292,8 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 	// Collect discovered peers (limit by config)
 	maxServers := sd.node.Config.Discovery.MaxServers
 	peerCount := 0
+	connectedServers := 0
+	filteredOutClients := 0
 
 	for peerInfo := range peerChan {
 		if peerInfo.ID == sd.node.Host.ID() {
@@ -300,8 +304,9 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 			break // Stop collecting after reaching limit
 		}
 
-		// Try to connect if not already connected
-		if sd.node.Host.Network().Connectedness(peerInfo.ID) == 0 { // Not connected
+		// First, try to connect to the peer to exchange protocol information
+		connectedness := sd.node.Host.Network().Connectedness(peerInfo.ID)
+		if connectedness == 0 { // Not connected
 			connectTimeout := time.Duration(sd.node.Config.Network.ConnectionTimeout) * time.Second
 			connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
 			if err := sd.node.Host.Connect(connectCtx, peerInfo); err != nil {
@@ -310,17 +315,67 @@ func (sd *ServerDiscovery) refreshServerList(ctx context.Context) error {
 				continue
 			}
 			connectCancel()
+			log.Printf("Connected to peer: %s", peerInfo.ID)
+			connectedServers++
 		}
 
+		// Give peer some time to register protocols after connection
+		time.Sleep(100 * time.Millisecond)
+
+		// Check if this peer is an exit-capable server
+		if !sd.isExitCapableServer(peerInfo.ID) {
+			log.Printf("Filtering out client-only node: %s", peerInfo.ID)
+			filteredOutClients++
+			// Disconnect from client nodes to save resources
+			if connectedness == 0 { // We just connected
+				sd.node.Host.Network().ClosePeer(peerInfo.ID)
+			}
+			continue
+		}
+
+		log.Printf("Verified exit-capable server node: %s", peerInfo.ID)
 		newServers = append(newServers, peerInfo)
-		log.Printf("Discovered server node: %s", peerInfo.ID)
 		peerCount++
 	}
 
 	sd.serverPeers = newServers
 	sd.lastUpdate = time.Now()
 
-	log.Printf("Discovered %d server nodes", len(newServers))
+	log.Printf("Server discovery complete: %d exit-capable servers found, %d client nodes filtered out",
+		len(newServers), filteredOutClients)
+	return nil
+}
+
+// Start implements NodeHandler interface - starts periodic server discovery
+func (sd *ServerDiscovery) Start(ctx context.Context, node *model.Node) error {
+	if sd.started {
+		return fmt.Errorf("ServerDiscovery already started")
+	}
+
+	sd.ctx, sd.ctxCancel = context.WithCancel(ctx)
+	sd.started = true
+
+	log.Printf("Starting server-to-server discovery with interval: %s, max servers: %d",
+		sd.updateInterval, sd.node.Config.Discovery.MaxServers)
+
+	// Start periodic discovery
+	sd.StartPeriodicDiscovery(sd.ctx)
+
+	return nil
+}
+
+// Stop implements NodeHandler interface - stops periodic server discovery
+func (sd *ServerDiscovery) Stop() error {
+	if !sd.started {
+		return nil
+	}
+
+	if sd.ctxCancel != nil {
+		sd.ctxCancel()
+	}
+	sd.started = false
+
+	log.Printf("Stopped server-to-server discovery")
 	return nil
 }
 
@@ -340,10 +395,102 @@ func (sd *ServerDiscovery) StartPeriodicDiscovery(ctx context.Context) {
 			case <-ticker.C:
 				if err := sd.refreshServerList(ctx); err != nil {
 					log.Printf("Periodic server discovery failed: %v", err)
+				} else {
+					connectedCount := sd.GetConnectedServerCount()
+					log.Printf("Server discovery update: %d server connections active", connectedCount)
 				}
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+// GetConnectedServerCount returns the number of currently connected server nodes
+func (sd *ServerDiscovery) GetConnectedServerCount() int {
+	count := 0
+	for _, server := range sd.serverPeers {
+		if server.ID != sd.node.Host.ID() && sd.node.Host.Network().Connectedness(server.ID) == 1 {
+			count++
+		}
+	}
+	return count
+}
+
+// isExitCapableServer checks if a peer supports relay protocol (indicating it's an exit-capable server)
+func (sd *ServerDiscovery) isExitCapableServer(peerID peer.ID) bool {
+	protocols, err := sd.node.Host.Peerstore().GetProtocols(peerID)
+	if err != nil {
+		log.Printf("Failed to get protocols for peer %s: %v", peerID, err)
+		return false
+	}
+
+	log.Printf("DEBUG: Peer %s advertises protocols: %v", peerID, protocols)
+
+	// Check if peer supports the relay protocol
+	relayProtocolPrefix := "/goxic-proxy/relay/"
+	for _, proto := range protocols {
+		protoStr := string(proto)
+		if len(protoStr) >= len(relayProtocolPrefix) && protoStr[:len(relayProtocolPrefix)] == relayProtocolPrefix {
+			log.Printf("Peer %s supports relay protocol: %s", peerID, protoStr)
+			return true
+		}
+	}
+
+	log.Printf("Peer %s does not support relay protocol (client-only node)", peerID)
+	return false
+}
+
+// refreshServerListForClient discovers server nodes from DHT without server-to-server filtering
+// This is used by client nodes to find any available exit servers on-demand
+func (sd *ServerDiscovery) refreshServerListForClient(ctx context.Context) error {
+	// Create a context with timeout for discovery
+	queryTimeout := time.Duration(sd.node.Config.Discovery.QueryTimeoutSec) * time.Second
+	discoveryCtx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	// Discover peers advertising the service
+	peerChan, err := sd.routingDiscovery.FindPeers(discoveryCtx, sd.node.Config.Network.Name)
+	if err != nil {
+		return fmt.Errorf("failed to find peers: %w", err)
+	}
+
+	newServers := make([]peer.AddrInfo, 0)
+
+	// Collect discovered peers (limit by config)
+	maxServers := sd.node.Config.Discovery.MaxServers
+	peerCount := 0
+
+	for peerInfo := range peerChan {
+		if peerInfo.ID == sd.node.Host.ID() {
+			continue // Skip self
+		}
+
+		if peerCount >= maxServers {
+			break // Stop collecting after reaching limit
+		}
+
+		// For client nodes, connect to all discovered peers and let protocol selection happen later
+		connectedness := sd.node.Host.Network().Connectedness(peerInfo.ID)
+		if connectedness == 0 { // Not connected
+			connectTimeout := time.Duration(sd.node.Config.Network.ConnectionTimeout) * time.Second
+			connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+			if err := sd.node.Host.Connect(connectCtx, peerInfo); err != nil {
+				log.Printf("Client: Failed to connect to discovered peer %s: %v", peerInfo.ID, err)
+				connectCancel()
+				continue
+			}
+			connectCancel()
+			log.Printf("Client: Connected to peer %s", peerInfo.ID)
+		}
+
+		newServers = append(newServers, peerInfo)
+		peerCount++
+	}
+
+	sd.serverPeers = newServers
+	sd.lastUpdate = time.Now()
+
+	log.Printf("Client discovery complete: %d peers found", len(newServers))
+	return nil
 }

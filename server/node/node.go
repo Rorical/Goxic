@@ -25,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoreds"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 )
 
@@ -168,6 +169,12 @@ func Run(ctx context.Context, config *model.Config) (*model.Node, error) {
 		}
 	}
 
+	idSer, err := identify.NewIDService(h, identify.WithMetricsTracer(identify.NewMetricsTracer()))
+	if err != nil {
+		return nil, err
+	}
+	idSer.Start()
+
 	var wg sync.WaitGroup
 	for _, addr := range bootNodesAddrs {
 		wg.Add(1)
@@ -205,61 +212,6 @@ func Run(ctx context.Context, config *model.Config) (*model.Node, error) {
 			select {
 			case <-ticker.C:
 				dutil.Advertise(node.CTX, routingDiscovery, serviceName)
-				break
-			case <-ctx.Done():
-				return
-			}
-		}
-	}(config.Network.Name)
-
-	// Discovery goroutine - find and connect to peers
-	go func(serviceName string) {
-		ticker := time.NewTicker(time.Duration(config.Discovery.UpdateIntervalSec) * time.Second)
-		defer ticker.Stop()
-
-		queryTimeout := time.Duration(config.Discovery.QueryTimeoutSec) * time.Second
-
-		for {
-			select {
-			case <-ticker.C:
-				queryCtx, cancel := context.WithTimeout(node.CTX, queryTimeout)
-				peerChan, err := routingDiscovery.FindPeers(queryCtx, serviceName)
-				if err != nil {
-					fmt.Printf("Peer discovery failed: %v\n", err)
-					cancel()
-					continue
-				}
-
-				peerCount := 0
-				for peer := range peerChan {
-					if peer.ID == node.Host.ID() {
-						continue
-					}
-					// check if already connected
-					if node.Host.Network().Connectedness(peer.ID) == 1 {
-						continue
-					}
-
-					// Connect with timeout
-					connectCtx, connectCancel := context.WithTimeout(node.CTX,
-						time.Duration(config.Network.ConnectionTimeout)*time.Second)
-					if err := node.Host.Connect(connectCtx, peer); err != nil {
-						log.Printf("Failed to connect to peer %s: %v", peer.ID, err)
-						connectCancel()
-						continue
-					}
-					connectCancel()
-
-					peerCount++
-					if peerCount >= config.Discovery.MaxServers {
-						break // Limit number of peers to discover per cycle
-					}
-				}
-				cancel()
-
-				if peerCount > 0 {
-					log.Printf("Connected to %d new peers", peerCount)
-				}
 				break
 			case <-ctx.Done():
 				return
